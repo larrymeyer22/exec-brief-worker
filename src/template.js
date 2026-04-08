@@ -21,11 +21,19 @@ export function buildHTML(execName, event, sections, legacyTextboxes, legacyTabl
   // Find cover content
   const overviewSection = sections.find(s => s.type === "brief_overview");
   const introCopy = getContent(overviewSection, nameLower) || "";
+  const hasBriefHeader = sections.some(s => s.type === "brief_header");
 
   // Build interior section HTML
   const bodyHTML = renderSections(execName, nameLower, sections, eventName, coverStyle);
 
-  const coverHTML = coverStyle === "compact"
+  const coverHTML = hasBriefHeader
+    ? `<!-- BRIEF HEADER (no cover page, no running header) -->
+<div class="page content-page">
+  <div class="page-body">
+    ${renderSectionRows(execName, nameLower, sections, eventName)}
+  </div>
+</div>`
+    : coverStyle === "compact"
     ? `<!-- COMPACT HEADER (no separate cover page) -->
 <div class="page content-page">
   <div class="compact-header">
@@ -88,6 +96,7 @@ ${coverHTML}
 function filterInteriorSections(sections, nameLower) {
   return sections.filter(s => {
     if (s.type === "brief_title") return false;
+    if (s.type === "footer") return false;
     if (s.type === "exec_enhancements") {
       return !!getOverride(s, nameLower);
     }
@@ -103,7 +112,7 @@ function titleToAnchor(title) {
 
 // Build TOC entry list from the interior sections array.
 // Excludes types that shouldn't appear as TOC entries.
-const TOC_SKIP = new Set(["table_of_contents", "logo", "large_image", "brief_title", "brief_overview"]);
+const TOC_SKIP = new Set(["table_of_contents", "logo", "large_image", "brief_title", "brief_header", "brief_overview", "footer"]);
 function buildTocEntries(interior) {
   return interior
     .filter(s => !TOC_SKIP.has(s.type) && (s.title || "").trim())
@@ -309,21 +318,54 @@ function renderSection(section, execName, nameLower, eventName, sectionIndex = 0
     }
 
     case "key_contacts": {
-      const headers = ["Name", "Role", "Phone", "Email"];
-      const colKeys = ["col_1", "col_2", "col_3", "col_4"];
-      return renderTable(section, title, headers, colKeys, null, bgStyle);
+      const items = section.items || [];
+      if (!items.length) return "";
+      const bullets = items.map(item => {
+        const name  = esc(item.col_1 || "");
+        const role  = esc(item.col_2 || "");
+        const phone = esc(item.col_3 || "");
+        const email = item.col_4 ? `<a href="mailto:${esc(item.col_4)}" style="color:#0563C1;text-decoration:underline;">${esc(item.col_4)}</a>` : "";
+        const parts = [role ? `<strong>${role}</strong>: ${name}` : name];
+        if (email) parts.push(`(${email})`);
+        if (phone) parts.push(`- ${phone}`);
+        return `<div style="font-size:9pt;padding:2px 0;"><span style="font-size:5.5pt;vertical-align:middle;margin-right:4px;">&#x2022;</span>${parts.join(" ")}</div>`;
+      }).join("");
+      return `<div class="section-wrap" style="${bgStyle}">
+        ${title ? `<div class="section-bar" style="${barStyle}">${esc(title)}</div>` : ""}
+        <div>${bullets}</div>
+      </div>`;
     }
 
     case "run_of_show": {
-      const headers = ["Time", "Segment", "Speaker", "Duration", "Notes"];
-      const colKeys = ["col_1", "col_2", "col_3", "col_4", "col_5"];
-      return renderTable(section, title, headers, colKeys, nameLower, bgStyle);
+      const rosItems = section.items || [];
+      if (!rosItems.length) return "";
+      const rosHeaders = ["Time", "Topic", "Presenter"];
+      const rosColKeys = ["col_1", "col_2", "col_3"];
+      const headerCells = rosHeaders.map(h => `<th>${esc(h)}</th>`).join("");
+      const rows = rosItems.map(item => {
+        const isExec = nameLower && (item.col_3 || "").toLowerCase().includes(nameLower);
+        const cells = rosColKeys.map((k, idx) => {
+          const bold = idx === 0 ? ' style="font-weight:bold;"' : '';
+          return `<td${bold}>${esc(item[k] || "")}</td>`;
+        }).join("");
+        return `<tr class="${isExec ? "exec-row" : ""}">${cells}</tr>`;
+      }).join("");
+      const rosTs = section.body_text_2 ? section.body_text_2.trim() : "";
+      const footNote = rosTs ? `<div style="text-align:right;font-size:8pt;color:#999;margin-top:2px;">Last updated: ${esc(new Date(rosTs).toLocaleString())}</div>` : "";
+      return `<div class="section-wrap" style="${bgStyle}">
+        <div class="section-bar">${esc(title)}</div>
+        <table><thead><tr>${headerCells}</tr></thead><tbody>${rows}</tbody></table>
+      </div>${footNote}`;
     }
 
     case "rehearsal_schedule": {
-      const headers = ["Time", "Session", "Location", "Participants", "Notes"];
-      const colKeys = ["col_1", "col_2", "col_3", "col_4", "col_5"];
-      return renderTable(section, title, headers, colKeys, nameLower, bgStyle);
+      // Auto-generated: body_text is pre-rendered HTML from DB rehearsal data
+      const rehContent = content ? content.trim() : "";
+      if (!rehContent || rehContent === "<!-- no rehearsals -->") return "";
+      return `<div class="section-wrap" style="${bgStyle}">
+        ${title ? `<div class="section-bar" style="${barStyle}">${esc(title)}</div>` : ""}
+        <div class="html-content-body">${rehContent}</div>
+      </div>`;
     }
 
     case "event_schedule": {
@@ -333,14 +375,33 @@ function renderSection(section, execName, nameLower, eventName, sectionIndex = 0
     }
 
     case "logo": {
+      const logoScale = Math.max(0.25, (parseInt(section.left_label) || 100) / 100);
+      const logoMaxPx = Math.round(96 * logoScale);
       if (section.image_b64) {
         const mime = section.image_mime || "image/png";
         return `<div class="section-wrap logo-wrap" style="${bgStyle}">
-          <img src="data:${mime};base64,${section.image_b64}" class="logo-img" alt="Logo">
+          <img src="data:${mime};base64,${section.image_b64}" style="max-height:${logoMaxPx}px;max-width:${logoMaxPx * 4}px;object-fit:contain;" alt="Logo">
         </div>`;
       }
       return `<div class="section-wrap logo-wrap" style="${bgStyle}">
         <div class="large-image-placeholder">[ Logo — attach image to section ]</div>
+      </div>`;
+    }
+
+    case "brief_header": {
+      const bannerHtml = section.body_text || "<strong style=\"color:#ffffff\">Executive Briefing</strong>";
+      const docTitle = section.left_label || "";
+      const logoB64 = section.logo_b64 || "";
+      const logoMime = section.logo_mime || "image/png";
+      return `<div class="section-wrap" style="margin-bottom:0.2in;">
+        ${logoB64 ? `<div style="margin-bottom:0.1in;"><img src="data:${logoMime};base64,${logoB64}" style="max-height:1in;max-width:1in;object-fit:contain;display:block;"></div>` : ""}
+        <div style="background:#032D42;padding:0.18in 0.2in;margin-bottom:0.28in;border-radius:6px;">
+          <div style="font-size:20pt;font-weight:bold;line-height:1.1;text-align:left;">${bannerHtml}</div>
+        </div>
+        <div style="font-size:11pt;font-weight:bold;color:#111111;">
+          ${esc(execName)}${docTitle ? ` — ${esc(docTitle)}` : ""}
+        </div>
+        ${section.event_meta ? `<div style="font-size:9pt;color:#555555;margin-top:4pt;">${esc(section.event_meta)}</div>` : ""}
       </div>`;
     }
 
@@ -354,6 +415,39 @@ function renderSection(section, execName, nameLower, eventName, sectionIndex = 0
       return `<div class="section-wrap" style="${bgStyle}">
         ${title ? `<div class="section-bar" style="${textColor}">${esc(title)}</div>` : ""}
         <div class="wag-grid">${colCards}</div>
+      </div>`;
+    }
+
+    case "meal_schedule": {
+      const mealRows = (section.meal_data && section.meal_data[nameLower !== undefined ? Object.keys(section.meal_data).find(k => k.toLowerCase() === nameLower) || Object.keys(section.meal_data)[0] : Object.keys(section.meal_data || {})[0]]) || section.items || [];
+      if (!mealRows.length) return "";
+      let config = {};
+      try { config = JSON.parse(section.body_text || '{}'); } catch {}
+      const days = config.days || ['Day 1', 'Day 2', 'Day 3', 'Day 4'];
+      const fmtDayHdr = (d) => {
+        const ci = d.indexOf(',');
+        if (ci < 0) return esc(d);
+        return `${esc(d.slice(0, ci))}<br/>${esc(d.slice(ci + 1).trim())}`;
+      };
+      const headerCells = `<th style="text-align:left;padding:6pt 8pt;font-size:8pt">Area</th>` + days.map(d => `<th style="text-align:center;padding:5pt 4pt;font-size:7.5pt;line-height:1.3">${fmtDayHdr(d)}</th>`).join('');
+      const bodyRows = mealRows.map(item => {
+        let cells = [];
+        try { cells = JSON.parse(item.col_4 || '[]'); } catch {}
+        cells = Array(4).fill(null).map((_, i) => cells[i] || { text: '', span: 1 });
+        let dayCells = '';
+        let ci = 0;
+        while (ci < 4) {
+          const cell = cells[ci] || { text: '', span: 1 };
+          const span = Math.min(Math.max(cell.span || 1, 1), 4 - ci);
+          const txt = (cell.text || '').replace(/\n/g, '<br/>');
+          dayCells += `<td class="meal-cell" colspan="${span}" style="font-size:7pt;white-space:nowrap">${txt}</td>`;
+          ci += span;
+        }
+        return `<tr><td style="padding:5pt 8pt;font-size:8pt"><div class="meal-venue">${esc(item.col_1 || '')}</div>${item.col_2 ? `<div class="meal-location">${esc(item.col_2)}</div>` : ''}</td>${dayCells}</tr>`;
+      }).join('');
+      return `<div class="section-wrap" style="${bgStyle}">
+        ${title ? `<div class="section-bar" style="${barStyle}">${esc(title)}</div>` : ""}
+        <table class="meal-table"><thead><tr style="background:#032D42;color:#fff">${headerCells}</tr></thead><tbody>${bodyRows}</tbody></table>
       </div>`;
     }
 
@@ -374,7 +468,7 @@ function renderSection(section, execName, nameLower, eventName, sectionIndex = 0
       const imgItem = (section.items || [])[0] || {};
       const headline  = imgItem.col_1 || "";
       const subhead   = imgItem.col_2 || "";
-      const caption   = imgItem.col_3 || "";
+      const caption   = section.caption || imgItem.col_3 || "";
       const imgTag    = section.image_b64
         ? `<img src="data:${section.image_mime || "image/png"};base64,${section.image_b64}" class="large-img" alt="${esc(headline)}">`
         : `<div class="large-image-placeholder">[ Image — attach image to section ]</div>`;
@@ -383,18 +477,18 @@ function renderSection(section, execName, nameLower, eventName, sectionIndex = 0
         ${headline ? `<div class="img-headline">${esc(headline)}</div>` : ""}
         ${subhead  ? `<div class="img-subhead">${esc(subhead)}</div>`   : ""}
         ${imgTag}
-        ${caption  ? `<div class="img-caption">${esc(caption)}</div>`   : ""}
+        ${caption  ? `<div class="img-caption">${caption}</div>`         : ""}
       </div>`;
     }
 
     case "table_of_contents": {
       if (tocEntries.length === 0) return "";
       const rows = tocEntries.map(e =>
-        `<div class="toc-row"><a class="toc-link" href="#${e.anchor}">${esc(e.title)}</a></div>`
+        `<div style="padding:2px 0;"><span style="font-size:5.5pt;vertical-align:middle;margin-right:4px;">&#x2022;</span><a class="toc-link" href="#${e.anchor}">${esc(e.title)}</a></div>`
       ).join("");
       return `<div class="section-wrap" style="${bgStyle}">
         ${title ? `<div class="section-bar" style="${barStyle}">${esc(title)}</div>` : ""}
-        <div class="toc-body">${rows}</div>
+        <div style="padding:2px 0;">${rows}</div>
       </div>`;
     }
 
@@ -675,7 +769,7 @@ body {
 }
 .toc-row:last-child { border-bottom: none; }
 .toc-link {
-  color: #032D42;
+  color: #4169E1;
   text-decoration: none;
   font-size: 9.5pt;
 }
@@ -756,13 +850,13 @@ tbody tr.exec-row td {
 
 /* ── Logo ── */
 .logo-wrap { text-align: left; padding: 0.1in 0; }
-.logo-img { max-height: 0.6in; max-width: 2in; object-fit: contain; }
+.logo-img { max-height: 1in; max-width: 1in; object-fit: contain; }
 
 /* ── Large image ── */
 .large-img { width: 100%; border-radius: 8px; display: block; margin: 0.1in 0; }
 .img-headline { font-size: 13pt; font-weight: 700; color: #032D42; margin-bottom: 0.04in; }
 .img-subhead  { font-size: 10pt; color: #6b7280; margin-bottom: 0.1in; }
-.img-caption  { font-size: 8pt; color: #9ca3af; margin-top: 0.06in; font-style: italic; }
+.img-caption  { font-size: 10pt; color: #111111; margin-top: 0.06in; font-style: italic; }
 
 /* ── HTML content (raw injection) ── */
 .html-content-body {
@@ -771,6 +865,7 @@ tbody tr.exec-row td {
 }
 .html-content-body p { margin-bottom: 0.08in; }
 .html-content-body ul, .html-content-body ol { padding-left: 1.2em; margin-bottom: 0.08in; }
+.html-content-body table td, .html-content-body table th { border: none !important; border-top: none !important; border-bottom: none !important; border-left: none !important; border-right: none !important; }
 
 /* ── Exec addition ── */
 .exec-addition {
@@ -805,6 +900,17 @@ tbody tr.exec-row td {
   border-bottom: 2px solid var(--accent);
   padding-bottom: 4px;
 }
+/* ── Meal Schedule ── */
+.meal-table { width:100%; border-collapse:collapse; font-size:9pt; }
+.meal-table th { background:#032D42; color:#fff; padding:6pt 8pt; text-align:center; font-weight:600; font-size:8.5pt; }
+.meal-table th:first-child { text-align:left; }
+.meal-table td { border:1px solid #d1d5db; padding:6pt 8pt; vertical-align:top; }
+.meal-table td:first-child { width:22%; font-size:8.5pt; }
+.meal-table td.meal-cell { text-align:center; font-size:8.5pt; color:#374151; }
+.meal-venue { font-weight:700; color:#111; margin-bottom:2pt; }
+.meal-location { font-size:7.5pt; color:#6b7280; }
+.meal-table tr:nth-child(even) td { background:#f9fafb; }
+
 .wag-table, td, th, caption { font-family: inherit; }
 body {
   font-family: 'Inter', Helvetica, Arial, sans-serif;
@@ -814,7 +920,9 @@ body {
 }
 .wag-body * { font-size: 7.5pt !important; font-family: 'Inter', Helvetica, Arial, sans-serif !important; }
 .wag-body p { margin-bottom: 0.05in; }
-.wag-body ul, .wag-body ol { padding-left: 1em; margin-bottom: 0.05in; }
+.wag-body ul { list-style-type: disc; padding-left: 1.4em; margin-bottom: 0.05in; }
+.wag-body ol { list-style-type: decimal; padding-left: 1.4em; margin-bottom: 0.05in; }
+.wag-body li { margin-bottom: 0.02in; }
 
 /* ── Compact header (no-cover mode) ── */
 .compact-header {
@@ -1026,29 +1134,65 @@ export function buildWordHTML(execName, event, sections, theme) {
   const accentColor    = (theme && theme.accent_color && !theme.accent_color.startsWith("var(")) ? theme.accent_color : "#032D42";
   const highlightColor = (theme && theme.highlight_color && !theme.highlight_color.startsWith("var(")) ? theme.highlight_color : "#62D84E";
 
+  const briefHeader = (sections || []).find(s => s.type === "brief_header");
+
   const interior = (sections || []).filter(s => {
-    if (s.type === "brief_title" || s.type === "logo") return false;
+    if (s.type === "brief_title") return false;
+    if (s.type === "brief_header") return false;
+    if (s.type === "footer") return false;
     if (s.type === "exec_enhancements") return !!getOverride(s, nameLower);
     return true;
   });
 
-  const sectionsHTML = interior.map(s => wordSection(s, execName, nameLower, accentColor, highlightColor)).filter(Boolean).join("\n");
+  // Pre-build TOC entries so wordSection can render them
+  const tocEntries = interior
+    .filter(s => !["table_of_contents","logo","large_image","brief_title","brief_header","brief_overview"].includes(s.type) && (s.title || "").trim())
+    .map(s => s.title);
+
+  const sectionsHTML = interior.map(s => wordSection(s, execName, nameLower, accentColor, highlightColor, tocEntries)).filter(Boolean).join("\n");
   const meta = [eventDates, location].filter(Boolean).join("  |  ");
 
-  return `<!DOCTYPE html>
+  const rawHtml = `<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>${esc(execName)} — ${esc(eventName)}</title></head>
-<body style="font-family:'Inter',Arial,sans-serif;font-size:11pt;color:#111111;margin:0;padding:0;">
-<h1 style="font-size:22pt;color:${accentColor};margin:0 0 6pt 0;">${esc(execName)}</h1>
-<h2 style="font-size:16pt;color:#444444;font-weight:normal;margin:0 0 4pt 0;">${esc(eventName)}</h2>
-${meta ? `<p style="font-size:10pt;color:#666666;margin:0 0 18pt 0;">${esc(meta)}</p>` : `<p style="margin:0 0 18pt 0;"></p>`}
-<hr style="border:none;border-top:2px solid ${accentColor};margin:0 0 18pt 0;">
+<head><meta charset="utf-8"><title>${esc(execName)} — ${esc(eventName)}</title>
+<style>
+body, p, div, span, td, th, table, ul, ol, li, h1, h2, h3, h4, h5, h6, strong, em, b, i, a { font-family: Arial, Helvetica, sans-serif !important; }
+</style>
+</head>
+<body style="font-family:Arial,Helvetica,sans-serif;font-size:11pt;color:#111111;margin:0;padding:0;">
+${briefHeader ? `
+${briefHeader.logo_b64 ? `<p style="font-family:Arial,Helvetica,sans-serif;margin:0 0 6pt 0;"><img src="data:${briefHeader.logo_mime || 'image/png'};base64,${briefHeader.logo_b64}" width="144" height="auto"></p>` : ""}
+<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#032D42;border:none;">
+  <tr>
+    <td style="padding:8pt 8pt;border:none;vertical-align:middle;">
+      <span style="font-family:Arial,Helvetica,sans-serif;font-size:20pt;font-weight:bold;">${((briefHeader.body_text || "<span style=\"color:#ffffff\">Executive Briefing</span>")).replace(/^<p[^>]*>/i,"").replace(/<\/p>$/i,"")}</span>
+    </td>
+  </tr>
+</table>
+<p style="font-family:Arial,Helvetica,sans-serif;font-size:11pt;font-weight:bold;color:#111111;margin:16pt 0 ${briefHeader.event_meta ? "2pt" : "18pt"} 0;">${esc(execName)}${briefHeader.left_label ? ` — ${esc(briefHeader.left_label)}` : ''}</p>
+${briefHeader.event_meta ? `<p style="font-family:Arial,Helvetica,sans-serif;font-size:9pt;color:#555555;margin:0 0 18pt 0;">${esc(briefHeader.event_meta)}</p>` : ""}
+` : `
+<table width="100%" cellpadding="0" cellspacing="0" style="background:${accentColor};margin:0 0 18pt 0;">
+  <tr>
+    <td style="padding:14pt 18pt 10pt 18pt;">
+      <p style="font-family:Arial,Helvetica,sans-serif;font-size:16pt;font-weight:bold;color:#ffffff;margin:0 0 4pt 0;">${esc(execName)}</p>
+      <p style="font-family:Arial,Helvetica,sans-serif;font-size:10pt;color:#aaaaaa;margin:0;">${esc(eventName)}${meta ? `  |  ${esc(meta)}` : ''}</p>
+    </td>
+  </tr>
+</table>
+`}
 ${sectionsHTML}
 </body>
 </html>`;
+  return rawHtml
+    .replace(/style="([^"]*)"/g, (_, s) => `style="font-family:Arial,Helvetica,sans-serif;${s}"`)
+    .replace(/<(p|li|span|strong|em|b|i|a|h[1-6])\b([^>]*?)>/gi, (match, tag, attrs) => {
+      if (/style\s*=/.test(attrs)) return match;
+      return `<${tag}${attrs} style="font-family:Arial,Helvetica,sans-serif;">`;
+    });
 }
 
-function wordSection(section, execName, nameLower, accentColor, highlightColor) {
+function wordSection(section, execName, nameLower, accentColor, highlightColor, tocEntries) {
   const type    = section.type;
   const title   = section.title || "";
   const content = getContent(section, nameLower);
@@ -1057,12 +1201,12 @@ function wordSection(section, execName, nameLower, accentColor, highlightColor) 
   const bgHex  = bgRaw && !bgRaw.startsWith("var(") ? bgRaw : null;
   const onDark = bgHex && bgHex !== "#ffffff" && bgHex !== "#f3f4f6";
 
-  const wrapStyle  = bgHex ? `background:${bgHex};padding:10pt 14pt;margin-bottom:14pt;` : `margin-bottom:14pt;`;
-  const titleStyle = onDark
-    ? `font-size:12pt;font-weight:bold;color:#ffffff;border-bottom:1px solid rgba(255,255,255,0.4);padding-bottom:4pt;margin:0 0 8pt 0;`
-    : `font-size:12pt;font-weight:bold;color:#ffffff;background:${accentColor};padding:4pt 8pt;margin:0 0 8pt 0;`;
-  const bodyStyle  = onDark ? `color:#ffffff;` : `color:#111111;`;
-  const titleHTML  = title ? `<div style="${titleStyle}">${esc(title)}</div>` : "";
+  const FF = `font-family:Arial,Helvetica,sans-serif;`;
+  const wrapStyle  = bgHex ? `${FF}background:${bgHex};padding:10pt 14pt;margin-bottom:14pt;` : `${FF}margin-bottom:14pt;`;
+  const titleStyle = `${FF}font-size:8pt;font-weight:bold;color:#444444;border-bottom:2px solid #cccccc;padding-bottom:2pt;margin:0 0 6pt 0;letter-spacing:0.5pt;`;
+  const bodyStyle  = onDark ? `${FF}color:#ffffff;` : `${FF}color:#111111;`;
+  const anchorId   = title ? titleToAnchor(title) : "";
+  const titleHTML  = title ? `<div id="${anchorId}" style="${titleStyle}">${esc(title.toUpperCase())}</div>` : "";
 
   switch (type) {
 
@@ -1072,7 +1216,7 @@ function wordSection(section, execName, nameLower, accentColor, highlightColor) 
     case "event_highlights":
     case "custom":
     case "html_content": {
-      const body = type === "html_content" ? (section.body_text || "") : (content || "");
+      const body = stripInlineStyles(type === "html_content" ? (section.body_text || "") : (content || ""));
       if (!body) return "";
       return `<div style="${wrapStyle}">${titleHTML}<div style="${bodyStyle}">${body}</div></div>`;
     }
@@ -1122,39 +1266,65 @@ function wordSection(section, execName, nameLower, accentColor, highlightColor) 
       return `<div style="${wrapStyle}">${titleHTML}<table style="border-collapse:collapse;width:100%;font-size:10pt;"><tr><td style="font-weight:bold;padding:4pt 8pt;border:1px solid #cccccc;width:25%;vertical-align:top;">${esc(leftLabel)}</td><td style="padding:4pt 8pt;border:1px solid #cccccc;width:37%;vertical-align:top;">${col2}</td><td style="padding:4pt 8pt;border:1px solid #cccccc;width:38%;vertical-align:top;">${col3}</td></tr></table></div>`;
     }
 
-    case "run_of_show":
-    case "rehearsal_schedule":
-    case "event_schedule": {
-      const colDefs = type === "run_of_show"
-        ? { headers: ["Time","Segment","Speaker","Duration","Notes"],          keys: ["col_1","col_2","col_3","col_4","col_5"] }
-        : type === "rehearsal_schedule"
-        ? { headers: ["Time","Session","Location","Participants","Notes"],     keys: ["col_1","col_2","col_3","col_4","col_5"] }
-        : { headers: ["Time","Session","Location"],                            keys: ["col_1","col_2","col_3"] };
+    case "rehearsal_schedule": {
+      // Auto-generated: body_text is pre-rendered HTML from DB rehearsal data
+      const rehContentW = content ? content.trim() : "";
+      if (!rehContentW || rehContentW === "<!-- no rehearsals -->") return "";
+      return `<div style="${wrapStyle}">${titleHTML}<div>${rehContentW}</div></div>`;
+    }
+
+    case "run_of_show": {
+      const rosHeaders = ["Time", "Topic", "Presenter"];
+      const rosKeys    = ["col_1", "col_2", "col_3"];
+      const colWidths  = ["22%", "52%", "26%"];
       const thStyle = `background:${accentColor};color:#ffffff;padding:4pt 6pt;border:1px solid #aaaaaa;font-size:9pt;text-align:left;`;
-      const headerRow = colDefs.headers.map(h => `<th style="${thStyle}">${esc(h)}</th>`).join("");
+      const headerRow = rosHeaders.map((h, idx) => `<th style="${thStyle}width:${colWidths[idx]};">${esc(h)}</th>`).join("");
       const dataRows  = (section.items || []).map((item, i) => {
-        const isExec = colDefs.keys.some(k => (item[k] || "").toLowerCase().includes(nameLower));
+        const isExec = ((item.col_3 || "").toLowerCase().includes(nameLower));
         const rowBg  = isExec ? `background:${highlightColor};` : (i % 2 === 1 ? "background:#f8f8f8;" : "");
-        const cells  = colDefs.keys.map(k =>
+        const cells  = rosKeys.map((k, idx) => {
+          const boldStyle = idx === 0 ? "font-weight:bold;" : "";
+          return `<td style="${rowBg}${boldStyle}padding:3pt 6pt;border:1px solid #cccccc;font-size:9pt;vertical-align:top;">${esc(item[k] || "")}</td>`;
+        }).join("");
+        return `<tr>${cells}</tr>`;
+      }).join("");
+      if (!dataRows) return "";
+      const rosTs2 = section.body_text_2 ? section.body_text_2.trim() : "";
+      const rosFootnote = rosTs2 ? `<div style="text-align:right;font-size:7pt;color:#999999;margin-top:2pt;">Last updated: ${esc(new Date(rosTs2).toLocaleString())}</div>` : "";
+      return `<div style="${wrapStyle}">${titleHTML}<table style="border-collapse:collapse;width:100%;"><thead><tr>${headerRow}</tr></thead><tbody>${dataRows}</tbody></table>${rosFootnote}</div>`;
+    }
+
+    case "event_schedule": {
+      const esHeaders = ["Time", "Session", "Location"];
+      const esKeys    = ["col_1", "col_2", "col_3"];
+      const thStyle2 = `background:${accentColor};color:#ffffff;padding:4pt 6pt;border:1px solid #aaaaaa;font-size:9pt;text-align:left;`;
+      const headerRow2 = esHeaders.map(h => `<th style="${thStyle2}">${esc(h)}</th>`).join("");
+      const dataRows2  = (section.items || []).map((item, i) => {
+        const isExec = esKeys.some(k => (item[k] || "").toLowerCase().includes(nameLower));
+        const rowBg  = isExec ? `background:${highlightColor};` : (i % 2 === 1 ? "background:#f8f8f8;" : "");
+        const cells  = esKeys.map(k =>
           `<td style="${rowBg}padding:3pt 6pt;border:1px solid #cccccc;font-size:9pt;vertical-align:top;">${esc(item[k] || "")}</td>`
         ).join("");
         return `<tr>${cells}</tr>`;
       }).join("");
-      if (!dataRows) return "";
-      return `<div style="${wrapStyle}">${titleHTML}<table style="border-collapse:collapse;width:100%;"><thead><tr>${headerRow}</tr></thead><tbody>${dataRows}</tbody></table></div>`;
+      if (!dataRows2) return "";
+      return `<div style="${wrapStyle}">${titleHTML}<table style="border-collapse:collapse;width:100%;"><thead><tr>${headerRow2}</tr></thead><tbody>${dataRows2}</tbody></table></div>`;
     }
 
     case "key_contacts": {
-      const thStyle   = `background:${accentColor};color:#ffffff;padding:4pt 6pt;border:1px solid #aaaaaa;font-size:9pt;text-align:left;`;
-      const headerRow = ["Name","Role","Phone","Email"].map(h => `<th style="${thStyle}">${esc(h)}</th>`).join("");
-      const dataRows  = (section.items || []).map((item, i) => {
-        const rowBg = i % 2 === 1 ? "background:#f8f8f8;" : "";
-        return `<tr>${["col_1","col_2","col_3","col_4"].map(k =>
-          `<td style="${rowBg}padding:3pt 6pt;border:1px solid #cccccc;font-size:9pt;vertical-align:top;">${esc(item[k] || "")}</td>`
-        ).join("")}</tr>`;
+      const items = section.items || [];
+      if (!items.length) return "";
+      const bullets = items.map(item => {
+        const name  = esc(item.col_1 || "");
+        const role  = esc(item.col_2 || "");
+        const phone = esc(item.col_3 || "");
+        const email = item.col_4 ? `<a href="mailto:${esc(item.col_4)}" style="color:#0563C1;text-decoration:underline;">${esc(item.col_4)}</a>` : "";
+        const parts = [role ? `<strong>${role}</strong>: ${name}` : name];
+        if (email) parts.push(`(${email})`);
+        if (phone) parts.push(`- ${phone}`);
+        return `<div style="${FF}font-size:9pt;padding:2px 0;"><span style="font-size:5.5pt;vertical-align:middle;margin-right:4px;">&#x2022;</span>${parts.join(" ")}</div>`;
       }).join("");
-      if (!dataRows) return "";
-      return `<div style="${wrapStyle}">${titleHTML}<table style="border-collapse:collapse;width:100%;"><thead><tr>${headerRow}</tr></thead><tbody>${dataRows}</tbody></table></div>`;
+      return `<div style="${wrapStyle}">${titleHTML}<div>${bullets}</div></div>`;
     }
 
     case "week_at_a_glance": {
@@ -1166,18 +1336,83 @@ function wordSection(section, execName, nameLower, accentColor, highlightColor) 
       return `<div style="${wrapStyle}">${titleHTML}<table style="border-collapse:collapse;width:100%;"><tr>${cells}</tr></table></div>`;
     }
 
+    case "meal_schedule": {
+      const mealRowsW = (section.meal_data && section.meal_data[Object.keys(section.meal_data)[0]]) || section.items || [];
+      if (!mealRowsW.length) return "";
+      let configW = {};
+      try { configW = JSON.parse(section.body_text || '{}'); } catch {}
+      const daysW = configW.days || ['Day 1', 'Day 2', 'Day 3', 'Day 4'];
+      const fmtDayHdrW = (d) => { const ci = d.indexOf(','); return ci < 0 ? esc(d) : `${esc(d.slice(0,ci))}<br/>${esc(d.slice(ci+1).trim())}`; };
+      const hdrW = `<th style="text-align:left;padding:4pt 6pt;border:1px solid #d1d5db;font-size:9pt">Area</th>` + daysW.map(d => `<th style="text-align:center;padding:4pt 6pt;border:1px solid #d1d5db;font-size:9pt;line-height:1.3">${fmtDayHdrW(d)}</th>`).join('');
+      const rowsW = mealRowsW.map(item => {
+        let cells = [];
+        try { cells = JSON.parse(item.col_4 || '[]'); } catch {}
+        cells = Array(4).fill(null).map((_, i) => cells[i] || { text: '', span: 1 });
+        let dc = ''; let ci = 0;
+        while (ci < 4) {
+          const cell = cells[ci] || { text: '', span: 1 };
+          const span = Math.min(Math.max(cell.span || 1, 1), 4 - ci);
+          dc += `<td colspan="${span}" style="text-align:center;padding:4pt 6pt;border:1px solid #d1d5db;font-size:9pt">${(cell.text||'').replace(/\n/g,'<br/>')}</td>`;
+          ci += span;
+        }
+        return `<tr><td style="padding:4pt 6pt;border:1px solid #d1d5db;font-size:9pt"><strong>${esc(item.col_1||'')}</strong>${item.col_2?`<br/><span style="font-size:8pt;color:#6b7280">${esc(item.col_2)}</span>`:''}</td>${dc}</tr>`;
+      }).join('');
+      return `<div style="${wrapStyle}">${titleHTML}<table style="border-collapse:collapse;width:100%"><thead><tr style="background:#032D42;color:#fff">${hdrW}</tr></thead><tbody>${rowsW}</tbody></table></div>`;
+    }
+
     case "at_a_glance_schedule":
     case "meeting_briefs": {
       if (!content || content.trim() === "<!-- no meetings -->") return "";
       return `<div style="${wrapStyle}">${titleHTML}<div style="${bodyStyle}font-size:10pt;">${content}</div></div>`;
     }
 
-    case "table_of_contents":
-    case "large_image":
+    case "brief_title": {
+      const body = getContent(section, nameLower);
+      return `<div style="${FF}background:${accentColor};color:#ffffff;padding:14pt 8pt;margin-bottom:18pt;">
+        <div style="${FF}font-size:16pt;font-weight:bold;color:#ffffff;margin:0 0 4pt 0;">${esc(execName)}</div>
+        ${body ? `<div style="${FF}font-size:10pt;color:rgba(255,255,255,0.85);">${body}</div>` : ""}
+      </div>`;
+    }
+
+    case "brief_header": {
+      // Strip outer <p> tags that Tiptap wraps content in — LibreOffice ignores
+      // font-size on parent <p> when a child <p> is present (nested p = invalid HTML)
+      const bannerInner = (section.body_text || "<span style=\"color:#ffffff\">Executive Briefing</span>")
+        .replace(/^<p[^>]*>/i, "").replace(/<\/p>$/i, "");
+      const docTitle = section.left_label || "";
+      const logoB64 = section.logo_b64 || "";
+      const logoMime = section.logo_mime || "image/png";
+      return `${logoB64 ? `<p style="${FF}margin:0 0 6pt 0;"><img src="data:${logoMime};base64,${logoB64}" width="144" height="auto"></p>` : ""}
+<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#032D42;border:none;margin-bottom:14pt;">
+  <tr><td style="padding:14pt 8pt;border:none;">
+    <span style="${FF}font-size:20pt;font-weight:bold;">${bannerInner}</span>
+  </td></tr>
+</table>
+<p style="${FF}font-size:11pt;font-weight:bold;color:#111111;margin:16pt 0 ${section.event_meta ? "2pt" : "18pt"} 0;">${esc(execName)}${docTitle ? ` — ${esc(docTitle)}` : ""}</p>
+${section.event_meta ? `<p style="${FF}font-size:9pt;color:#555555;margin:0 0 18pt 0;">${esc(section.event_meta)}</p>` : ""}`;
+    }
+
+    case "table_of_contents": {
+      if (!tocEntries || !tocEntries.length) return "";
+      const bullets = tocEntries.map(t => {
+        const href = titleToAnchor(t);
+        return `<div style="${FF}font-size:9pt;padding:2px 0;"><span style="font-size:5.5pt;vertical-align:middle;margin-right:4px;">&#x2022;</span><a href="#${href}" style="${FF}color:#4169E1;text-decoration:underline;">${esc(t)}</a></div>`;
+      }).join("");
+      return `<div style="${wrapStyle}">${titleHTML}<div>${bullets}</div></div>`;
+    }
+
+    case "large_image": {
+      if (!section.image_b64) return "";
+      const caption = section.caption || "";
+      return `${title ? `<div id="${anchorId}" style="${titleStyle}page-break-after:avoid;">${esc(title.toUpperCase())}</div>` : ""}<div style="${FF}margin:0 0 14pt 0;"><img src="data:${section.image_mime || "image/png"};base64,${section.image_b64}" style="${FF}width:550px;height:auto;display:block;">${caption ? `<div style="${FF}font-size:10pt;color:#111111;font-style:italic;margin-top:4pt;">${caption}</div>` : ""}</div>`;
+    }
+
     case "hotel_info":
-    case "brief_title":
     case "logo": {
-      return "";
+      if (!section.image_b64) return "";
+      const logoScaleW = Math.max(0.25, (parseInt(section.left_label) || 100) / 100);
+      const logoWidthPx = Math.round(144 * logoScaleW);
+      return `<p style="${FF}margin:0 0 10pt 0;"><img src="data:${section.image_mime || "image/png"};base64,${section.image_b64}" width="${logoWidthPx}" height="auto"></p>`;
     }
 
     default: {

@@ -155,7 +155,38 @@ export default {
           footerConf: htmlEsc(document.body.dataset.footerConf || ""),
         };
       });
-      const footerTemplate = `<div style="width:100%;padding:0 0.5in;box-sizing:border-box;font-family:Helvetica,Arial,sans-serif;font-size:7.5pt;color:#9ca3af;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #e5e7eb;padding-top:3px;margin-top:4px;"><span>${footerData.execName}</span><span>${footerData.footerConf}</span></div>`;
+
+      // Build footer from footer section config if present and enabled
+      const footerSec = (data.sections || []).find(s => s.type === "footer" && s.subhead !== "0" && s.subhead !== 0);
+      let footerTemplate;
+      if (footerSec) {
+        let cfg = {};
+        try { cfg = JSON.parse(footerSec.body_text || "{}"); } catch {}
+        const eventName = (data.event && data.event.name) || "";
+        function resolveZone(val, customText) {
+          switch (val) {
+            case "exec_name": return footerData.execName;
+            case "event_name": return esc(eventName);
+            case "page_number": return `<span class="pageNumber"></span>&nbsp;/&nbsp;<span class="totalPages"></span>`;
+            case "confidential": return "Confidential";
+            case "date": return new Date().toLocaleDateString("en-US", {month:"short",day:"numeric",year:"numeric"});
+            case "custom": return esc(customText || "");
+            default: return "";
+          }
+          function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+        }
+        const left   = resolveZone(cfg.left,   cfg.left_text);
+        const center = resolveZone(cfg.center, cfg.center_text);
+        const right  = resolveZone(cfg.right,  cfg.right_text);
+        const cellStyle = `font-family:Helvetica,Arial,sans-serif;font-size:7.5pt;color:#111111;padding:0;`;
+        footerTemplate = `<div style="width:100%;padding:0 0.5in;box-sizing:border-box;border-top:1px solid #111111;margin-top:4px;padding-top:3px;"><table style="width:100%;border-collapse:collapse;"><tr>
+    <td style="${cellStyle}width:33%;text-align:left;">${left}</td>
+    <td style="${cellStyle}width:34%;text-align:center;">${center}</td>
+    <td style="${cellStyle}width:33%;text-align:right;">${right}</td>
+  </tr></table></div>`;
+      } else {
+        footerTemplate = `<div style="width:100%;padding:0 0.5in;box-sizing:border-box;font-family:Helvetica,Arial,sans-serif;font-size:7.5pt;color:#111111;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #111111;padding-top:3px;margin-top:4px;"><span>${footerData.execName}</span><span>${footerData.footerConf}</span></div>`;
+      }
       const pdf = await page.pdf({
         preferCSSPageSize: true,
         printBackground: true,
