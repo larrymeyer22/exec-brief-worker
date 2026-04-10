@@ -112,7 +112,7 @@ function titleToAnchor(title) {
 
 // Build TOC entry list from the interior sections array.
 // Excludes types that shouldn't appear as TOC entries.
-const TOC_SKIP = new Set(["table_of_contents", "logo", "large_image", "brief_title", "brief_header", "brief_overview", "footer"]);
+const TOC_SKIP = new Set(["table_of_contents", "logo", "large_image", "brief_title", "brief_header", "brief_overview", "footer", "full_page_graphic", "travel_page"]);
 function buildTocEntries(interior) {
   return interior
     .filter(s => !TOC_SKIP.has(s.type) && (s.title || "").trim())
@@ -492,6 +492,29 @@ function renderSection(section, execName, nameLower, eventName, sectionIndex = 0
       </div>`;
     }
 
+    case "travel_page":
+    case "full_page_graphic": {
+      const fpgConfig = section.fpg_config || {};
+      const overlaysHtml = (fpgConfig.overlays || []).map(o => {
+        const os = [
+          `top:${o.top || "0pt"}`, `left:${o.left || "0pt"}`,
+          o.width  ? `width:${o.width};max-width:${o.width}` : "",
+          o.height ? `height:${o.height}` : "",
+          `font-size:${o.font_size || "12pt"}`,
+          `font-weight:${o.font_weight || "normal"}`,
+          `color:${o.color || "#000000"}`,
+          `text-align:${o.text_align || "left"}`,
+          o.bg_color ? `background:${o.bg_color}` : "",
+          o.padding  ? `padding:${o.padding}` : "",
+        ].filter(Boolean).join(";");
+        return `<div class="fpg-overlay" style="${os}">${esc(o.resolved_content !== undefined ? o.resolved_content : (o.content || ""))}</div>`;
+      }).join("");
+      return `<div class="fpg-wrap">${section.image_b64
+        ? `<img src="data:image/jpeg;base64,${section.image_b64}" alt="" />`
+        : `<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#999;font-size:11pt;">[No background — select a Slide Background in section settings]</div>`
+      }${overlaysHtml}</div>`;
+    }
+
     default: {
       if (content) {
         return `<div class="section-wrap" style="${bgStyle}">
@@ -731,6 +754,20 @@ body {
 
 /* ── Section layout ── */
 .section-wrap { margin-bottom: 0.22in; break-inside: avoid; }
+
+/* ── Full-page graphic section ── */
+.fpg-wrap {
+  page-break-before: always;
+  page-break-after: always;
+  margin: -0.3in -0.5in;
+  width: 7.5in;
+  height: 9.6in;
+  position: relative;
+  overflow: hidden;
+  background: #000;
+}
+.fpg-wrap img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: fill; display: block; }
+.fpg-overlay { position: absolute; word-wrap: break-word; overflow-wrap: break-word; overflow: hidden; box-sizing: border-box; white-space: pre-wrap; }
 
 .row-pair {
   display: flex;

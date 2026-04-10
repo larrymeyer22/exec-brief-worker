@@ -123,6 +123,30 @@ export default {
       });
     }
 
+    // ── POST /generate-raw  (guest briefs — raw HTML + custom page size) ────────
+    if (request.method === "POST" && url.pathname === "/generate-raw") {
+      let payload;
+      try { payload = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+      const { html, pageWidth, pageHeight } = payload;
+      if (!html) return json({ error: "html is required" }, 400);
+
+      const browser = await puppeteer.launch(env.BROWSER);
+      const page = await browser.newPage();
+      await page.setContent(html, { waitUntil: "networkidle0" });
+      const pdfBuffer = await page.pdf({
+        width: pageWidth || "7.5in",
+        height: pageHeight || "10in",
+        printBackground: true,
+        margin: { top: 0, right: 0, bottom: 0, left: 0 },
+      });
+      await browser.close();
+
+      const base64 = uint8ToBase64(new Uint8Array(pdfBuffer));
+      return new Response(JSON.stringify({ pdf: base64 }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders() },
+      });
+    }
+
     if (request.method !== "POST" || url.pathname !== "/generate") {
       return json({ error: "POST /generate only" }, 404);
     }
