@@ -1,7 +1,7 @@
 // ── Entry point ───────────────────────────────────────────────────────────────
 // Supports both new sections-based payload and legacy textboxes/tables payload
 
-export function buildHTML(execName, event, sections, legacyTextboxes, legacyTables, theme) {
+export function buildHTML(execName, event, sections, legacyTextboxes, legacyTables, theme, headerFooter = {}) {
 
   // Legacy fallback for old POC payload format
   if ((!sections || sections.length === 0) && legacyTextboxes) {
@@ -11,6 +11,13 @@ export function buildHTML(execName, event, sections, legacyTextboxes, legacyTabl
   const nameLower = execName.toLowerCase();
   const eventName = (event && event.name) || "Executive Briefing";
   const showConfidential = event && event.show_confidential !== false;
+  const hTop    = headerFooter.headerHeight || '0in';
+  const hBottom = headerFooter.footerHeight  || '0.4in';
+  const hasGraphicHeader = sections.some(s => s.type === "graphic_header");
+  // Add 0.25in breathing room below graphic header on every page (incl. continuations)
+  const hTopPadded = hasGraphicHeader
+    ? `${(parseFloat(hTop) + 0.25).toFixed(2)}in`
+    : hTop;
   const confidentialLabel = showConfidential ? `${esc(eventName)}  |  Confidential` : esc(eventName);
   const coverStyle = (event && event.cover_style) || "full";
   const accentColor = (theme && theme.accent_color) || "var(--accent)";
@@ -23,16 +30,24 @@ export function buildHTML(execName, event, sections, legacyTextboxes, legacyTabl
   const introCopy = getContent(overviewSection, nameLower) || "";
   const hasBriefHeader = sections.some(s => s.type === "brief_header");
 
-  // Build interior section HTML
+  // Build interior section HTML (fallback for standard full-cover layout)
   const bodyHTML = renderSections(execName, nameLower, sections, eventName, coverStyle);
 
-  const coverHTML = hasBriefHeader
-    ? `<!-- BRIEF HEADER (no cover page, no running header) -->
+  // Check if FPG sections exist — if so, use renderInteriorHTML to put FPGs at body
+  // level where CSS named pages (page: fpg) are honoured, suppressing the header.
+  const hasFPGSections = filterInteriorSections(sections, nameLower).some(
+    s => s.type === "full_page_graphic" || s.type === "travel_page");
+
+  const coverHTML = (hasBriefHeader || hasGraphicHeader)
+    ? (hasFPGSections
+      ? `<!-- GRAPHIC HEADER — FPG sections lifted to body level for named page support -->
+${renderInteriorHTML(execName, nameLower, sections, eventName)}`
+      : `<!-- ${hasBriefHeader ? 'BRIEF' : 'GRAPHIC'} HEADER (no cover page, no running header) -->
 <div class="page content-page">
   <div class="page-body">
     ${renderSectionRows(execName, nameLower, sections, eventName)}
   </div>
-</div>`
+</div>`)
     : coverStyle === "compact"
     ? `<!-- COMPACT HEADER (no separate cover page) -->
 <div class="page content-page">
@@ -83,9 +98,13 @@ ${bodyHTML}`;
   --highlight-text: ${highlightText};
 }
 ${baseCSS()}
+@page { margin: ${hTopPadded} 0 ${hBottom} 0; }
+@page fpg { margin: 0 0 ${hBottom} 0; }
+/* Standalone FPG (direct body child) — no .page-body padding to undo */
+body > .fpg-wrap { margin: 0; page-break-before: auto; }
 </style>
 </head>
-<body data-exec-name="${esc(execName)}" data-footer-conf="${confidentialLabel}">
+<body data-exec-name="${esc(execName)}" data-footer-conf="${confidentialLabel}"${(event && event.section_bar_style === 'display') ? ' class="bar-display"' : ''}>
 ${coverHTML}
 </body>
 </html>`;
@@ -97,6 +116,8 @@ function filterInteriorSections(sections, nameLower) {
   return sections.filter(s => {
     if (s.type === "brief_title") return false;
     if (s.type === "footer") return false;
+    if (s.type === "graphic_header") return false;
+    if (s.type === "graphic_footer") return false;
     if (s.type === "exec_enhancements") {
       return !!getOverride(s, nameLower);
     }
@@ -112,7 +133,7 @@ function titleToAnchor(title) {
 
 // Build TOC entry list from the interior sections array.
 // Excludes types that shouldn't appear as TOC entries.
-const TOC_SKIP = new Set(["table_of_contents", "logo", "large_image", "brief_title", "brief_header", "brief_overview", "footer", "full_page_graphic", "travel_page"]);
+const TOC_SKIP = new Set(["table_of_contents", "logo", "large_image", "brief_title", "brief_header", "brief_overview", "footer", "graphic_header", "graphic_footer", "full_page_graphic", "travel_page"]);
 function buildTocEntries(interior) {
   return interior
     .filter(s => !TOC_SKIP.has(s.type) && (s.title || "").trim())
@@ -134,16 +155,56 @@ function renderSectionRows(execName, nameLower, sections, eventName) {
   }).join("\n");
 }
 
-function renderSections(execName, nameLower, sections, eventName, coverStyle) {
+// FPG sections are emitted as direct body children so `page: fpg` is honoured
+// by Chromium, suppressing the Puppeteer header on those pages.
+// Non-FPG sections are grouped into normal .page.content-page blocks.
+function renderInteriorHTML(execName, nameLower, sections, eventName) {
+  const interior = filterInteriorSections(sections, nameLower);
+  if (interior.length === 0) return "";
+  const tocEntries = buildTocEntries(interior);
+
+  const segments = [];
+  let currentGroup = [];
+  for (const s of interior) {
+    if (s.type === "full_page_graphic" || s.type === "travel_page") {
+      if (currentGroup.length > 0) { segments.push({ type: "content", items: currentGroup }); currentGroup = []; }
+      segments.push({ type: "fpg", section: s });
+    } else {
+      currentGroup.push(s);
+    }
+  }
+  if (currentGroup.length > 0) segments.push({ type: "content", items: currentGroup });
+
+  let idx = 0;
+  return segments.map(seg => {
+    if (seg.type === "fpg") {
+      return renderSection(seg.section, execName, nameLower, eventName, idx++, tocEntries);
+    }
+    const rows = groupIntoRows(seg.items);
+    const rowsHTML = rows.map(row => {
+      if (row.type === "pair") {
+        const li = idx++, ri = idx++;
+        return renderRow(row, execName, nameLower, eventName, li, ri, tocEntries);
+      }
+      return renderRow(row, execName, nameLower, eventName, idx++, null, tocEntries);
+    }).join("\n");
+    return `<div class="page content-page">
+  <div class="page-body">${rowsHTML}</div>
+</div>`;
+  }).join("\n");
+}
+
+function renderSections(execName, nameLower, sections, eventName, coverStyle, hidePageHeader = false) {
   if (coverStyle === "compact") return "";
   const interior = filterInteriorSections(sections, nameLower);
   if (interior.length === 0) return "";
   const rowsHTML = renderSectionRows(execName, nameLower, sections, eventName);
-  return `<div class="page content-page">
-  <div class="page-header">
+  const pageHeaderHTML = hidePageHeader ? "" : `<div class="page-header">
     <div class="page-header-title">${esc(eventName)}</div>
     <div class="page-header-right">${esc(eventName)}  |  Confidential</div>
-  </div>
+  </div>`;
+  return `<div class="page content-page">
+  ${pageHeaderHTML}
   <div class="page-body">
     ${rowsHTML}
   </div>
@@ -496,6 +557,9 @@ function renderSection(section, execName, nameLower, eventName, sectionIndex = 0
     case "full_page_graphic": {
       const fpgConfig = section.fpg_config || {};
       const overlaysHtml = (fpgConfig.overlays || []).map(o => {
+        const rawContent = o.resolved_content !== undefined ? o.resolved_content : (o.content || "");
+        const isHtml   = o.is_html === true || (typeof rawContent === "string" && rawContent.trim().startsWith("<"));
+        const isButton = o.overlay_type === "button";
         const os = [
           `top:${o.top || "0pt"}`, `left:${o.left || "0pt"}`,
           o.width  ? `width:${o.width};max-width:${o.width}` : "",
@@ -504,12 +568,20 @@ function renderSection(section, execName, nameLower, eventName, sectionIndex = 0
           `font-weight:${o.font_weight || "normal"}`,
           `color:${o.color || "#000000"}`,
           `text-align:${o.text_align || "left"}`,
-          o.bg_color ? `background:${o.bg_color}` : "",
-          o.padding  ? `padding:${o.padding}` : "",
+          o.bg_color      ? `background:${o.bg_color}` : "",
+          o.padding       ? `padding:${o.padding}` : "",
+          o.border_radius ? `border-radius:${o.border_radius}` : "",
+          isHtml          ? "white-space:normal" : "",
+          isButton        ? "display:inline-flex;align-items:center;justify-content:center" : "",
         ].filter(Boolean).join(";");
-        return `<div class="fpg-overlay" style="${os}">${esc(o.resolved_content !== undefined ? o.resolved_content : (o.content || ""))}</div>`;
+        const content = isHtml ? rawContent : esc(rawContent);
+        const linked = (isButton && o.href)
+          ? `<a href="${esc(o.href)}" style="display:block;width:100%;height:100%;text-decoration:none;color:inherit;">${content}</a>`
+          : content;
+        return `<div class="fpg-overlay" style="${os}">${linked}</div>`;
       }).join("");
-      return `<div class="fpg-wrap">${section.image_b64
+      const hideFooter = fpgConfig.hide_footer === true || fpgConfig.hide_footer === "true";
+      return `<div class="fpg-wrap${hideFooter ? ' fpg-no-footer' : ''}">${section.image_b64
         ? `<img src="data:image/jpeg;base64,${section.image_b64}" alt="" />`
         : `<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#999;font-size:11pt;">[No background — select a Slide Background in section settings]</div>`
       }${overlaysHtml}</div>`;
@@ -655,6 +727,7 @@ function baseCSS() {
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 @page { size: 7.5in 10in; margin: 0 0 0.4in 0; }
+@page fpg-no-footer { size: 7.5in 10in; margin: 0; }
 
 table, td, th, caption { font-family: inherit; }
 body {
@@ -757,6 +830,7 @@ body {
 
 /* ── Full-page graphic section ── */
 .fpg-wrap {
+  page: fpg;
   page-break-before: always;
   page-break-after: always;
   margin: -0.3in -0.5in;
@@ -766,8 +840,16 @@ body {
   overflow: hidden;
   background: #000;
 }
-.fpg-wrap img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: fill; display: block; }
+.fpg-wrap.fpg-no-footer {
+  page: fpg-no-footer;
+  height: 10in;
+}
+.fpg-wrap img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
 .fpg-overlay { position: absolute; word-wrap: break-word; overflow-wrap: break-word; overflow: hidden; box-sizing: border-box; white-space: pre-wrap; }
+.fpg-overlay p { margin: 0; padding: 0; }
+.fpg-overlay strong { font-weight: bold; }
+.fpg-overlay em { font-style: italic; }
+.fpg-overlay u { text-decoration: underline; }
 
 .row-pair {
   display: flex;
@@ -791,6 +873,13 @@ body {
   margin-bottom: 0.1in;
   border-bottom: 2px solid #032D42;
   break-after: avoid;
+}
+body.bar-display .section-bar {
+  font-size: 16pt;
+  text-transform: none;
+  letter-spacing: 0;
+  border-bottom: none;
+  padding-bottom: 0;
 }
 
 .section-richtext {
@@ -1177,6 +1266,8 @@ export function buildWordHTML(execName, event, sections, theme) {
     if (s.type === "brief_title") return false;
     if (s.type === "brief_header") return false;
     if (s.type === "footer") return false;
+    if (s.type === "graphic_header") return false;
+    if (s.type === "graphic_footer") return false;
     if (s.type === "exec_enhancements") return !!getOverride(s, nameLower);
     return true;
   });

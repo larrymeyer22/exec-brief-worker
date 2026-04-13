@@ -1,4 +1,5 @@
 import puppeteer from "@cloudflare/puppeteer";
+import { PDFDocument } from "pdf-lib";
 import { buildHTML, buildBriefingBookHTML, buildWordHTML } from "./template.js";
 
 export default {
@@ -81,9 +82,22 @@ export default {
       const execName = data.exec_name;
       if (!execName) return json({ error: "exec_name is required" }, 400);
       const outputMode = url.searchParams.get("output");
+      // Build headerFooter from graphic_header/footer sections (same logic as /generate)
+      const isEnabled = s => s.subhead !== "0" && s.subhead !== 0;
+      const previewHeaderFooter = {};
+      const ghSec = (data.sections || []).find(s => s.type === "graphic_header" && isEnabled(s));
+      const gfSec = (data.sections || []).find(s => s.type === "graphic_footer" && isEnabled(s));
+      if (ghSec) {
+        let cfg = {}; try { cfg = JSON.parse(ghSec.body_text || "{}"); } catch {}
+        previewHeaderFooter.headerHeight = cfg.height || "1in";
+      }
+      if (gfSec) {
+        let cfg = {}; try { cfg = JSON.parse(gfSec.body_text || "{}"); } catch {}
+        previewHeaderFooter.footerHeight = cfg.height || "0.5in";
+      }
       const html = outputMode === "word"
         ? buildWordHTML(execName, data.event || {}, data.sections || [], data.theme)
-        : buildHTML(execName, data.event || {}, data.sections || [], data.textboxes, data.tables, data.theme);
+        : buildHTML(execName, data.event || {}, data.sections || [], data.textboxes, data.tables, data.theme, previewHeaderFooter);
       return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders() } });
     }
 
@@ -166,8 +180,18 @@ export default {
     const browser = await puppeteer.launch(env.BROWSER);
     const zipEntries = [];
 
+    // Detect graphic header/footer sections once (shared across all execs)
+    const isEnabled = s => s.subhead !== "0" && s.subhead !== 0;
+    const graphicHeaderSec = (data.sections || []).find(s => s.type === "graphic_header" && isEnabled(s) && s.image_b64);
+    const graphicFooterSec = (data.sections || []).find(s => s.type === "graphic_footer" && isEnabled(s) && s.image_b64);
+    const ghHeight = graphicHeaderSec ? (graphicHeaderSec.banner_height || "1in") : null;
+    const gfHeight = graphicFooterSec ? (graphicFooterSec.banner_height || "0.5in") : null;
+    const headerFooter = {};
+    if (ghHeight) headerFooter.headerHeight = ghHeight;
+    if (gfHeight) headerFooter.footerHeight = gfHeight;
+
     for (const execName of exec_names) {
-      const html = buildHTML(execName, data.event || {}, data.sections || [], data.textboxes, data.tables, theme);
+      const html = buildHTML(execName, data.event || {}, data.sections || [], data.textboxes, data.tables, theme, headerFooter);
       const page = await browser.newPage();
       await page.setContent(html, { waitUntil: "networkidle0" });
       const footerData = await page.evaluate(() => {
@@ -180,10 +204,20 @@ export default {
         };
       });
 
-      // Build footer from footer section config if present and enabled
-      const footerSec = (data.sections || []).find(s => s.type === "footer" && s.subhead !== "0" && s.subhead !== 0);
+      // Build header template — graphic image or empty
+      let headerTemplate = "<span></span>";
+      if (graphicHeaderSec) {
+        const hMime = graphicHeaderSec.image_mime || "image/jpeg";
+        headerTemplate = `<img src="data:${hMime};base64,${graphicHeaderSec.image_b64}" style="width:100%;height:${ghHeight};display:block;object-fit:cover;margin:0;padding:0;" />`;
+      }
+
+      // Build footer template — graphic image, configured text footer, or default text footer
+      const footerSec = !graphicFooterSec && (data.sections || []).find(s => s.type === "footer" && isEnabled(s));
       let footerTemplate;
-      if (footerSec) {
+      if (graphicFooterSec) {
+        const fMime = graphicFooterSec.image_mime || "image/jpeg";
+        footerTemplate = `<img src="data:${fMime};base64,${graphicFooterSec.image_b64}" style="width:100%;height:${gfHeight};display:block;object-fit:cover;margin:0;padding:0;" />`;
+      } else if (footerSec) {
         let cfg = {};
         try { cfg = JSON.parse(footerSec.body_text || "{}"); } catch {}
         const eventName = (data.event && data.event.name) || "";
@@ -211,14 +245,62 @@ export default {
       } else {
         footerTemplate = `<div style="width:100%;padding:0 0.5in;box-sizing:border-box;font-family:Helvetica,Arial,sans-serif;font-size:7.5pt;color:#111111;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #111111;padding-top:3px;margin-top:4px;"><span>${footerData.execName}</span><span>${footerData.footerConf}</span></div>`;
       }
-      const pdf = await page.pdf({
-        preferCSSPageSize: true,
-        printBackground: true,
-        margin: { top: 0, right: 0, bottom: 0, left: 0 },
-        displayHeaderFooter: true,
-        headerTemplate: "<span></span>",
-        footerTemplate,
+      // Detect FPG pages and their footer-hide state from the DOM.
+      const fpgPages = await page.evaluate(() => {
+        const results = [];
+        let pos = 1;
+        for (const el of document.body.children) {
+          if (el.classList.contains('fpg-wrap')) {
+            results.push({ pos, hideFooter: el.classList.contains('fpg-no-footer') });
+            pos++;
+          } else if (el.classList.contains('page')) { pos++; }
+        }
+        return results;
       });
+
+      let pdf;
+      if (graphicHeaderSec && fpgPages.length > 0) {
+        const pdfOpts = { preferCSSPageSize: true, printBackground: true, margin: { top: 0, right: 0, bottom: 0, left: 0 } };
+
+        // Pass 1: full header + footer (for content pages)
+        const pdfFull = await page.pdf({ ...pdfOpts, displayHeaderFooter: true, headerTemplate, footerTemplate });
+
+        // Pass 2: no header, keep footer (for FPG pages that show footer)
+        const pdfNoHdr = await page.pdf({ ...pdfOpts, displayHeaderFooter: true, headerTemplate: "<span></span>", footerTemplate });
+
+        // Pass 3 (only if needed): no header, no footer (for FPG pages that hide footer)
+        const anyHideFooter = fpgPages.some(f => f.hideFooter);
+        let pdfBare = null;
+        if (anyHideFooter) {
+          pdfBare = await page.pdf({ ...pdfOpts, displayHeaderFooter: false });
+        }
+
+        const docFull   = await PDFDocument.load(pdfFull);
+        const docNoHdr  = await PDFDocument.load(pdfNoHdr);
+        const docBare   = pdfBare ? await PDFDocument.load(pdfBare) : null;
+        const pageCount = docFull.getPageCount();
+
+        const fpgPosSet      = new Set(fpgPages.map(f => f.pos));
+        const fpgHideFootSet = new Set(fpgPages.filter(f => f.hideFooter).map(f => f.pos));
+
+        const merged = await PDFDocument.create();
+        for (let i = 0; i < pageCount; i++) {
+          const pageNum = i + 1;
+          const src = fpgHideFootSet.has(pageNum) ? docBare
+                    : fpgPosSet.has(pageNum)      ? docNoHdr
+                    : docFull;
+          const [pg] = await merged.copyPages(src, [i]);
+          merged.addPage(pg);
+        }
+        pdf = await merged.save();
+      } else {
+        pdf = await page.pdf({
+          preferCSSPageSize: true, printBackground: true,
+          margin: { top: 0, right: 0, bottom: 0, left: 0 },
+          displayHeaderFooter: true,
+          headerTemplate, footerTemplate,
+        });
+      }
       await page.close();
       const safe = execName.replace(/[^a-zA-Z0-9_-]/g, "_");
       zipEntries.push({ name: `${safe}_briefing.pdf`, data: pdf });
