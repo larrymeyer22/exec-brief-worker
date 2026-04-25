@@ -111,7 +111,7 @@ export default {
       const html = buildBriefingBookHTML(exec_name, event || {}, meetings || [], sections || []);
       const browser = await puppeteer.launch(env.BROWSER);
       const page = await browser.newPage();
-      await page.setContent(html, { waitUntil: "networkidle0" });
+      await page.setContent(html, { waitUntil: "load", timeout: 60000 });
       const pdfBuffer = await page.pdf({
         format: "Letter",
         printBackground: true,
@@ -146,7 +146,7 @@ export default {
 
       const browser = await puppeteer.launch(env.BROWSER);
       const page = await browser.newPage();
-      await page.setContent(html, { waitUntil: "networkidle0" });
+      await page.setContent(html, { waitUntil: "load", timeout: 60000 });
       const pdfBuffer = await page.pdf({
         width: pageWidth || "7.5in",
         height: pageHeight || "10in",
@@ -182,8 +182,8 @@ export default {
 
     // Detect graphic header/footer sections once (shared across all execs)
     const isEnabled = s => s.subhead !== "0" && s.subhead !== 0;
-    const graphicHeaderSec = (data.sections || []).find(s => s.type === "graphic_header" && isEnabled(s) && s.image_b64);
-    const graphicFooterSec = (data.sections || []).find(s => s.type === "graphic_footer" && isEnabled(s) && s.image_b64);
+    const graphicHeaderSec = (data.sections || []).find(s => s.type === "graphic_header" && isEnabled(s) && (s.image_url || s.image_b64));
+    const graphicFooterSec = (data.sections || []).find(s => s.type === "graphic_footer" && isEnabled(s) && (s.image_url || s.image_b64));
     const ghHeight = graphicHeaderSec ? (graphicHeaderSec.banner_height || "1in") : null;
     const gfHeight = graphicFooterSec ? (graphicFooterSec.banner_height || "0.5in") : null;
     const headerFooter = {};
@@ -193,7 +193,7 @@ export default {
     for (const execName of exec_names) {
       const html = buildHTML(execName, data.event || {}, data.sections || [], data.textboxes, data.tables, theme, headerFooter);
       const page = await browser.newPage();
-      await page.setContent(html, { waitUntil: "networkidle0" });
+      await page.setContent(html, { waitUntil: "load", timeout: 60000 });
       const footerData = await page.evaluate(() => {
         function htmlEsc(s) {
           return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -204,11 +204,25 @@ export default {
         };
       });
 
+      // Helper: fetch a URL and return as data URI. Required for Puppeteer header/footer
+      // templates which run in a separate rendering context that can't reliably load
+      // external URLs — so we inline header/footer images as base64.
+      const urlToDataUri = async (url, fallbackMime) => {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Failed to fetch header asset ${url}: ${res.status}`);
+        const buf = new Uint8Array(await res.arrayBuffer());
+        const mime = res.headers.get('content-type') || fallbackMime || 'image/jpeg';
+        return `data:${mime};base64,${uint8ToBase64(buf)}`;
+      };
+
       // Build header template — graphic image or empty
       let headerTemplate = "<span></span>";
       if (graphicHeaderSec) {
         const hMime = graphicHeaderSec.image_mime || "image/jpeg";
-        headerTemplate = `<img src="data:${hMime};base64,${graphicHeaderSec.image_b64}" style="width:100%;height:${ghHeight};display:block;object-fit:cover;margin:0;padding:0;" />`;
+        let hSrc;
+        if (graphicHeaderSec.image_url) hSrc = await urlToDataUri(graphicHeaderSec.image_url, hMime);
+        else if (graphicHeaderSec.image_b64) hSrc = `data:${hMime};base64,${graphicHeaderSec.image_b64}`;
+        if (hSrc) headerTemplate = `<img src="${hSrc}" style="width:100%;height:${ghHeight};display:block;object-fit:cover;margin:0;padding:0;" />`;
       }
 
       // Build footer template — graphic image, configured text footer, or default text footer
@@ -216,7 +230,12 @@ export default {
       let footerTemplate;
       if (graphicFooterSec) {
         const fMime = graphicFooterSec.image_mime || "image/jpeg";
-        footerTemplate = `<img src="data:${fMime};base64,${graphicFooterSec.image_b64}" style="width:100%;height:${gfHeight};display:block;object-fit:cover;margin:0;padding:0;" />`;
+        let fSrc;
+        if (graphicFooterSec.image_url) fSrc = await urlToDataUri(graphicFooterSec.image_url, fMime);
+        else if (graphicFooterSec.image_b64) fSrc = `data:${fMime};base64,${graphicFooterSec.image_b64}`;
+        footerTemplate = fSrc
+          ? `<img src="${fSrc}" style="width:100%;height:${gfHeight};display:block;object-fit:cover;margin:0;padding:0;" />`
+          : "<span></span>";
       } else if (footerSec) {
         let cfg = {};
         try { cfg = JSON.parse(footerSec.body_text || "{}"); } catch {}
@@ -245,62 +264,89 @@ export default {
       } else {
         footerTemplate = `<div style="width:100%;padding:0 0.5in;box-sizing:border-box;font-family:Helvetica,Arial,sans-serif;font-size:7.5pt;color:#111111;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #111111;padding-top:3px;margin-top:4px;"><span>${footerData.execName}</span><span>${footerData.footerConf}</span></div>`;
       }
-      // Detect FPG pages and their footer-hide state from the DOM.
-      const fpgPages = await page.evaluate(() => {
-        const results = [];
-        let pos = 1;
+      // Detect FPG / gallery / full_page_content pages by walking body children.
+      // We render FPG-like pages with displayHeaderFooter:false so Puppeteer doesn't overlay
+      // header/footer templates on full-bleed pages (CSS @page margin:0 alone isn't reliable
+      // for suppressing Puppeteer's header/footer rendering).
+      const contentAreaIn = 10 - parseFloat(ghHeight || '0') - 0.25 - parseFloat(gfHeight || '0.4');
+      const pageInfo = await page.evaluate((contentAreaIn) => {
+        const CONTENT_H = contentAreaIn * 96;
+        const noChrome = new Set();   // no header, no footer (gallery + fpg with hide_footer)
+        const fpgFooter = new Set();  // empty header, footer (fpg without hide_footer)
+        let currentPage = 1;
         for (const el of document.body.children) {
-          if (el.classList.contains('fpg-wrap')) {
-            results.push({ pos, hideFooter: el.classList.contains('fpg-no-footer') });
-            pos++;
-          } else if (el.classList.contains('page')) { pos++; }
+          if (el.nodeType !== 1) continue;
+          if (el.classList.contains('gallery-page')) {
+            noChrome.add(currentPage);
+            currentPage++;
+          } else if (el.classList.contains('fpg-wrap')) {
+            if (el.classList.contains('fpg-no-footer')) noChrome.add(currentPage);
+            else fpgFooter.add(currentPage);
+            currentPage++;
+          } else if (el.classList.contains('page')) {
+            const pages = Math.max(1, Math.ceil(el.scrollHeight / CONTENT_H));
+            currentPage += pages;
+          }
         }
-        return results;
-      });
+        return { noChromePages: [...noChrome], fpgFooterPages: [...fpgFooter], totalPages: currentPage - 1 };
+      }, contentAreaIn);
+
+      const noChromeSet = new Set(pageInfo.noChromePages);
+      const fpgFooterSet = new Set(pageInfo.fpgFooterPages);
+      const totalPages = pageInfo.totalPages;
+      const pageType = p => noChromeSet.has(p) ? 'noChrome' : fpgFooterSet.has(p) ? 'fpgFooter' : 'regular';
 
       let pdf;
-      if (graphicHeaderSec && fpgPages.length > 0) {
-        const pdfOpts = { preferCSSPageSize: true, printBackground: true, margin: { top: 0, right: 0, bottom: 0, left: 0 } };
-
-        // Pass 1: full header + footer (for content pages)
-        const pdfFull = await page.pdf({ ...pdfOpts, displayHeaderFooter: true, headerTemplate, footerTemplate });
-
-        // Pass 2: no header, keep footer (for FPG pages that show footer)
-        const pdfNoHdr = await page.pdf({ ...pdfOpts, displayHeaderFooter: true, headerTemplate: "<span></span>", footerTemplate });
-
-        // Pass 3 (only if needed): no header, no footer (for FPG pages that hide footer)
-        const anyHideFooter = fpgPages.some(f => f.hideFooter);
-        let pdfBare = null;
-        if (anyHideFooter) {
-          pdfBare = await page.pdf({ ...pdfOpts, displayHeaderFooter: false });
-        }
-
-        const docFull   = await PDFDocument.load(pdfFull);
-        const docNoHdr  = await PDFDocument.load(pdfNoHdr);
-        const docBare   = pdfBare ? await PDFDocument.load(pdfBare) : null;
-        const pageCount = docFull.getPageCount();
-
-        const fpgPosSet      = new Set(fpgPages.map(f => f.pos));
-        const fpgHideFootSet = new Set(fpgPages.filter(f => f.hideFooter).map(f => f.pos));
-
-        const merged = await PDFDocument.create();
-        for (let i = 0; i < pageCount; i++) {
-          const pageNum = i + 1;
-          const src = fpgHideFootSet.has(pageNum) ? docBare
-                    : fpgPosSet.has(pageNum)      ? docNoHdr
-                    : docFull;
-          const [pg] = await merged.copyPages(src, [i]);
-          merged.addPage(pg);
-        }
-        pdf = await merged.save();
-      } else {
+      if (noChromeSet.size === 0 && fpgFooterSet.size === 0) {
+        // No full-bleed pages — single pass with header/footer on all pages.
         pdf = await page.pdf({
           preferCSSPageSize: true, printBackground: true,
           margin: { top: 0, right: 0, bottom: 0, left: 0 },
           displayHeaderFooter: true,
           headerTemplate, footerTemplate,
         });
+      } else {
+        // Group contiguous pages by style and render each run as its own page.pdf() call.
+        const pdfOpts = { preferCSSPageSize: true, printBackground: true, margin: { top: 0, right: 0, bottom: 0, left: 0 } };
+        let merged = await PDFDocument.create();
+        let runStart = 1;
+        let runType = pageType(1);
+        const processRun = async (start, endExclusive, type) => {
+          if (endExclusive <= start) return;
+          const range = endExclusive - 1 === start ? `${start}` : `${start}-${endExclusive - 1}`;
+          let opts;
+          if (type === 'noChrome') {
+            opts = { ...pdfOpts, pageRanges: range, displayHeaderFooter: false };
+          } else if (type === 'fpgFooter') {
+            opts = { ...pdfOpts, pageRanges: range, displayHeaderFooter: true, headerTemplate: '<span></span>', footerTemplate };
+          } else {
+            opts = { ...pdfOpts, pageRanges: range, displayHeaderFooter: true, headerTemplate, footerTemplate };
+          }
+          let chunkBytes = await page.pdf(opts);
+          let chunkDoc = await PDFDocument.load(chunkBytes);
+          chunkBytes = null;
+          const n = chunkDoc.getPageCount();
+          for (let i = 0; i < n; i++) {
+            const [pg] = await merged.copyPages(chunkDoc, [i]);
+            merged.addPage(pg);
+          }
+          chunkDoc = null;
+        };
+
+        for (let p = 2; p <= totalPages; p++) {
+          const t = pageType(p);
+          if (t !== runType) {
+            await processRun(runStart, p, runType);
+            runStart = p;
+            runType = t;
+          }
+        }
+        await processRun(runStart, totalPages + 1, runType);
+
+        pdf = await merged.save();
+        merged = null;
       }
+      console.log(`[${execName}] PDF rendered: ${pdf.byteLength} bytes (${(pdf.byteLength/1024/1024).toFixed(2)} MB)`);
       await page.close();
       const safe = execName.replace(/[^a-zA-Z0-9_-]/g, "_");
       zipEntries.push({ name: `${safe}_briefing.pdf`, data: pdf });
@@ -332,14 +378,20 @@ export default {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Safe base64 encoder that works on large Uint8Arrays without spread operator
+// Chunked base64 encoder — processes in 3072-byte chunks (multiple of 3 so btoa doesn't pad
+// mid-stream). Keeps peak memory near 1.33× the input size instead of ~3.5× from building
+// a full UTF-16 binary string first.
 function uint8ToBase64(bytes) {
-  let binary = "";
+  const CHUNK = 3072;
+  let result = "";
   const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < len; i += CHUNK) {
+    const end = Math.min(i + CHUNK, len);
+    let binary = "";
+    for (let j = i; j < end; j++) binary += String.fromCharCode(bytes[j]);
+    result += btoa(binary);
   }
-  return btoa(binary);
+  return result;
 }
 
 function corsHeaders() {
